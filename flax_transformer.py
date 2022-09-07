@@ -39,16 +39,16 @@ from jax import lax, jit, vmap, random
 class TransformerConfig:
   """Global hyperparameters used to minimize obnoxious kwarg plumbing."""
   num_heads: int = 4
-  num_enc_layers: int = 1
-  num_dec_layers: int = 1
+  num_enc_layers: int = 2
+  num_dec_layers: int = 2
   dropout_rate: float = 0.1
   deterministic: bool = False
   d_model: int = 40
   max_len: int = 3000
   obs_emb_hidden_sizes: Sequence[int] = (100,)
-  num_mixtures: int = 5
+  num_mixtures: int = 4
   num_latents: int = 2
-  covariance_eps: float = 0.001
+  covariance_eps: float = 0.0001
   checkpoint: str = ''
   default_device: int = 0
 
@@ -77,25 +77,29 @@ def spring_dy_dt(y, t, mass, k):
 # odeint_jit = odeint, static_argnums=(0,)
 vect_odeint = vmap(odeint,in_axes=(None,0,None,0,0))
 
-def add_proportional_noise(array, std_noise_ratio, subkey):
+def add_proportional_noise(array, std_noise_ratio, subkey, clip=True):
   std = std_noise_ratio * lax.abs(array) + 1e-6
   array = jax.random.normal(subkey, array.shape) * std + array
-  array = jnp.clip(array, a_min=1e-5)
+  if clip:
+    array = jnp.clip(array, a_min=1e-5)
   return array
 
 @partial(jit, static_argnums=[1,2])
 def generative_model(key, batch_size, num_times, noise_std_ratio = 0.05):
     key, *subkeys = random.split(key, 10)
     batch_y0 = random.uniform(subkeys[0], (batch_size,), minval=-10.0, maxval=10.0)
-    batch_y0 = jnp.stack([jnp.zeros((batch_size,)),batch_y0],axis=1)
-    batch_mass = random.uniform(subkeys[1], (batch_size,), minval=0.001, maxval=1.0)
-    batch_k = random.uniform(subkeys[2], (batch_size,), minval=0.001, maxval=1.0)
+    # batch_y0 = jnp.stack([jnp.zeros((batch_size,)),batch_y0],axis=1)
+    batch_y0 = jnp.stack([jnp.zeros((batch_size,)),jnp.ones((batch_size,))*1.0],axis=1)
+    # batch_c = random.choice(subkeys[0], jnp.array([10.0,1.0]), (batch_size,))
+    batch_mass = random.uniform(subkeys[1], (batch_size,), minval=0.1, maxval=1.0)
+    # batch_mass = random.choice(subkeys[1], jnp.array([0.1,1.]), (batch_size,))
+    # batch_k = batch_c * batch_mass
+    batch_k = random.uniform(subkeys[2], (batch_size,), minval=1.0, maxval=10.0)
     batch_k_noise = add_proportional_noise(batch_k, noise_std_ratio, subkeys[4])
     batch_mass_noise = add_proportional_noise(batch_mass, noise_std_ratio, subkeys[5])
     all_y = vect_odeint(spring_dy_dt, batch_y0, jnp.linspace(0,10,num_times), batch_mass_noise, batch_k_noise)
     batch_positions = all_y[:,:,1]
-    batch_positions = add_proportional_noise(batch_positions, noise_std_ratio,subkeys[3])
-    # batch_positions = jax.random.normal(subkeys[3],batch_positions.shape) * std + batch_positions
+    batch_positions = add_proportional_noise(batch_positions, noise_std_ratio,subkeys[3], clip=False)
     #expand positions since the MLP should learn to embed per observation.
     return batch_positions[:,:,None], \
            jnp.stack([batch_mass, batch_k],axis=1)[:,None]
@@ -212,6 +216,7 @@ class DecoderLayer(nn.Module):
     Returns:
       output after transformer encoder block.
     """
+     
     cfg = self.config
 
     # Decoder block.
@@ -255,19 +260,19 @@ class TransformerStack(nn.Module):
     x = ObsEmbed(cfg)(q)
     enc_input = PositionalEncoder(cfg)(x)
 
-    for _ in range(cfg.num_enc_layers):
-      enc_input = EncoderLayer(cfg)(enc_input)
+    # for _ in range(cfg.num_enc_layers):
+    enc_input = nn.Sequential([EncoderLayer(cfg) for _ in range(cfg.num_enc_layers)])(enc_input)
 
     start = self.param('start', nn.initializers.uniform(),(1,1,cfg.d_model))
     so_far_dec = start.repeat(q.shape[0],axis=0)
     
-    decoder = DecoderLayer(cfg)
+
     seq_decoded = []
     for _ in range(cfg.num_mixtures):
       dec = so_far_dec
+      # dec = decoder(dec, enc_input)
       for _ in range(cfg.num_dec_layers):
-        dec = decoder(dec,enc_input)
-      # so_far_dec = jnp.concatenate([so_far_dec, lax.stop_gradient(dec)],axis=1)
+        dec = DecoderLayer(cfg)(dec,enc_input)
       so_far_dec = jnp.concatenate([so_far_dec, lax.stop_gradient(dec[:,-1:])],axis=1)
       seq_decoded.append(dec[:,-1:,:])
     seq_decoded = jnp.concatenate(seq_decoded, axis=1)
@@ -307,7 +312,7 @@ class TransformerGaussianMixturePosterior(nn.Module):
     x = x.reshape(output_shape)
     x = jnp.triu(x)
 
-    eps = jnp.eye(num_means)[None,None]
+    eps = jnp.eye(num_means)[None,None] * eps
     cov_matrices = jnp.matmul(x, x.swapaxes(-2,-1)) + eps
     return cov_matrices
 
@@ -318,6 +323,10 @@ def gaussian_mixture_logpdf(latents, dist_params):
     category_log_prob = jax.lax.log(mix_p)
     
     return jax.nn.logsumexp(normals_log_prob + category_log_prob, axis=1)
+
+def gaussian_mixture_sample(dist_params):
+    mix_p, means, covs = dist_params['mix_p'], dist_params['means'], dist_params['covariance_matrices']
+
 
 
 def update_step(apply_fn, q, latents, opt_state, params, state, dropout_key):

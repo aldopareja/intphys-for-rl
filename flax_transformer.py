@@ -48,7 +48,7 @@ class TransformerConfig:
   obs_emb_hidden_sizes: Sequence[int] = (100,)
   num_mixtures: int = 4
   num_latents: int = 2
-  covariance_eps: float = 0.0001
+  covariance_eps: float = 1e-5
   checkpoint: str = ''
   default_device: int = 0
 

@@ -12,8 +12,8 @@ from flax import linen as nn
 class TransformerConfig:
   """Global hyperparameters used to minimize obnoxious kwarg plumbing."""
   num_heads: int = 4
-  num_enc_layers: int = 2
-  num_dec_layers: int = 2
+  num_enc_layers: int = 1
+  num_dec_layers: int = 1
   dropout_rate: float = 0.1
   deterministic: bool = False
   d_model: int = 100
@@ -242,7 +242,8 @@ def gaussian_mixture_logpdf(latents, dist_params):
   ''' 
   Parameters:
   --------------
-  latents: jax.array with shape Batch x num_latents
+  latents: jax.array with shape Batch x 1 x num_latents
+    the single dimension is needed so that the same sample gets broadcasted through all mixtures
   dist_params: Dict(
           mix_p: jax.array with shape Batch x num_mixtures encoding the probability of each mixture
           means: jax.array with shape Batch x num_mixtures x num_means with the multivariate mean of each mixture
@@ -265,6 +266,8 @@ class IndependentGaussianMixtureConfig:
 
 class IndependentGaussianMixtures(nn.Module):
   config: IndependentGaussianMixtureConfig
+  mixtures_cfg: GaussianMixturePosteriorConfig
+  transformer_cfg: TransformerConfig
 
   @nn.compact
   def __call__(self, q):
@@ -279,14 +282,16 @@ class IndependentGaussianMixtures(nn.Module):
         see :meth:`gaussian_mixture_logpdf`
     '''
     cfg = self.config
-    transformer_cfg = TransformerConfig(num_mixtures=sum(cfg.num_mixtures_per_group))
+    transformer_cfg = self.transformer_cfg.replace(num_mixtures=sum(cfg.num_mixtures_per_group))
+    mixtures_cfg = self.mixtures_cfg
+
     seq_decoded = TransformerStack(transformer_cfg)(q)
     
-    v = jnp.cumsum(jnp.array((0, *cfg.group_variables)))
+    v = jnp.cumsum(jnp.array((0, *cfg.num_mixtures_per_group)))
     seq_dec_list = [seq_decoded[:,v[i]:v[i+1]] for i in range(len(v)-1)]
     dist_params_list = []
     for seq_dec,n_vars in zip(seq_dec_list, cfg.group_variables):
-      d_pars = TransformerGaussianMixturePosterior(GaussianMixturePosteriorConfig(num_latents=n_vars))(seq_dec)
+      d_pars = TransformerGaussianMixturePosterior(mixtures_cfg.replace(num_latents=n_vars))(seq_dec)
       dist_params_list.append(d_pars)
     
     return dist_params_list
@@ -295,6 +300,7 @@ if __name__ == "__main__":
   m = IndependentGaussianMixtures(IndependentGaussianMixtureConfig())
   key, *subkeys = split(PRNGKey(11234), 4)
   init_rngs = {'params': subkeys[0], 'dropout':subkeys[1]}
+  variables = m.init(init_rngs, jnp.ones((batch_size, obs_lenght, 1)))
   m.init(init_rngs,jnp.ones((100,6,999)))
     
 

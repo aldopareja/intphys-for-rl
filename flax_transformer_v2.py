@@ -297,7 +297,7 @@ class IndependentGaussianMixtures(nn.Module):
     return dist_params_list
 
 if __name__ == "__main__":
-  m = IndependentGaussianMixtures(IndependentGaussianMixtureConfig())
+  m = IndependentGaussianMixtures(IndependentGaussianMixtureConfig(), GaussianMixturePosteriorConfig(), TransformerConfig())
   key, *subkeys = split(PRNGKey(11234), 4)
   init_rngs = {'params': subkeys[0], 'dropout':subkeys[1]}
   variables = m.init(init_rngs, jnp.ones((batch_size, obs_lenght, 1)))

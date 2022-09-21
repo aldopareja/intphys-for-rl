@@ -1,4 +1,5 @@
 from copy import deepcopy
+from typing import Dict
 
 import numpy as onp
 
@@ -22,9 +23,7 @@ from flax_transformer_v2 import (
     IndependentGaussianMixtures,
     IndependentGaussianMixtureConfig,
     GaussianMixturePosteriorConfig,
-    TransformerGaussianMixturePosterior,
     TransformerConfig,
-    TransformerStack,
     gaussian_mixture_logpdf,
 )
 
@@ -93,7 +92,7 @@ def render_depth_array(env_cfg, qp_dict, height=320, width=320):
     return x
 
 
-def get_point_cloud_from_depth(depth_map: onp.ndarray, sample_size):
+def get_point_cloud_from_depth(depth_map: onp.ndarray, sample_size, normalize: Dict[float,float]={'x':320,'y':320}):
     """gets a point cloud of `sample_size` numbers from `depth_map`
     It first ignores the far plane, then computes x,y,z as the x,y pixel coordinates and
     sets z as the depth value in `depth_array`.
@@ -102,17 +101,22 @@ def get_point_cloud_from_depth(depth_map: onp.ndarray, sample_size):
     -------------
         depth_map: onp.ndarray
             Height x Width array with the depth values of each pixel
+        sample_size: number of samples from the given point cloud. This get sampled from the 
+            foreground depth map with replacement.
+        normalize:
 
     Returns:
     -------------
         point_cloud: onp.ndarray
             `sample_size` x 3 array with each row having the x,y,z coordinates of each
-            point
+            point. x and y are the pixel values, whereas z is the distance from the camera.
     """
     non_far_mask = depth_map > -1e4
     x, y = non_far_mask.nonzero()
     z = depth_map[x, y]
-    point_clouds = onp.stack([x, y, z], axis=1)
+    if normalize['x'] != 1.0 or normalize['y'] != 1.0:
+        z = 1/(-1-z)
+    point_clouds = onp.stack([x/normalize['x'], y/normalize['y'], z], axis=1)
     idx = onp.random.randint(0, point_clouds.shape[0], sample_size)
     return point_clouds[idx]
 
@@ -199,13 +203,11 @@ def update_step(apply_fn, p_clouds, latents_list, opt_state, params, state, drop
         d_params_list = apply_fn(
             {"params": params, **state}, p_clouds, rngs={"dropout": dropout_key}
         )
-        l = sum(
-            [
+        l = [
                 -gaussian_mixture_logpdf(l, d).mean()
                 for l, d in zip(latents_list, d_params_list)
             ]
-        )
-        return l
+        return sum(l)
 
     l, grads = jax.value_and_grad(loss, has_aux=False)(params)
     updates, opt_state = tx.update(grads, opt_state)

@@ -1,6 +1,8 @@
 from typing import Sequence
 from dataclasses import field
 
+import numpy as onp
+
 import jax
 from jax import numpy as jnp
 from jax.random import split, PRNGKey
@@ -234,7 +236,7 @@ class TransformerGaussianMixturePosterior(nn.Module):
             [nn.Dense(cfg.emb_size), nn.relu, nn.Dense(num_mixture_params)]
         )(seq_decoded)
 
-        mix_p = jnp.exp(dist_params[:, :, 0])
+        mix_p = jax.nn.softmax(dist_params[:, :, 0])
         means = dist_params[:, :, 1 : 1 + num_means]
         covariance_terms = dist_params[:, :, -num_covariance_terms:]
         covariance_matrices = self.get_cov_matrices_from_vectors(
@@ -242,7 +244,7 @@ class TransformerGaussianMixturePosterior(nn.Module):
         )
 
         return dict(
-            mix_p=mix_p / mix_p.sum(axis=1, keepdims=True),
+            mix_p=mix_p,
             means=means,
             covariance_matrices=covariance_matrices,
         )
@@ -283,6 +285,32 @@ def gaussian_mixture_logpdf(latents, dist_params):
 
     return jax.nn.logsumexp(normals_log_prob + category_log_prob, axis=1)
 
+def select_mixture_sample(all_mixtures, index):
+    '''takes a single sample from a mixture density num_mixtures x num_variables and returns the value given by the :index:
+    mixture num_variables
+    '''
+    return all_mixtures[index,:]
+
+'''by vectorizing over the batch size, we can pick from each batch, a corresponding index.
+essentially a fast version of:
+
+    onp.concatenate([batched_all_mixtures[i,i] for i in batched_index])
+'''
+v_select_mixture_sample = jax.vmap(select_mixture_sample, in_axes=(0, 0))
+
+def gaussian_mixture_sample(key, dist_params):
+    mix_p, means, covs = (
+        dist_params["mix_p"],
+        dist_params["means"],
+        dist_params["covariance_matrices"],
+    )
+    key, subkey = split(key)
+    n_sample = jax.random.multivariate_normal(key, means, covs)
+    cat_sample = jax.random.categorical(subkey, jax.lax.log(mix_p), axis=-1)
+    
+    chosen_sample = v_select_mixture_sample(n_sample, cat_sample)
+    return chosen_sample
+
 
 @struct.dataclass
 class IndependentGaussianMixtureConfig:
@@ -317,7 +345,7 @@ class IndependentGaussianMixtures(nn.Module):
 
         seq_decoded = TransformerStack(transformer_cfg)(q)
 
-        v = jnp.cumsum(jnp.array((0, *cfg.num_mixtures_per_group)))
+        v = onp.cumsum(onp.array((0, *cfg.num_mixtures_per_group)))
         seq_dec_list = [seq_decoded[:, v[i] : v[i + 1]] for i in range(len(v) - 1)]
         
         dist_params_list = []

@@ -294,7 +294,7 @@ def select_mixture_sample(all_mixtures, index):
 '''by vectorizing over the batch size, we can pick from each batch, a corresponding index.
 essentially a fast version of:
 
-    onp.concatenate([batched_all_mixtures[i,i] for i in batched_index])
+    onp.concatenate([batched_all_mixtures[i,idx] for i,idx in enumerate(batched_index)])
 '''
 v_select_mixture_sample = jax.vmap(select_mixture_sample, in_axes=(0, 0))
 

@@ -1,14 +1,21 @@
+from functools import partial
 from typing import Sequence
 from dataclasses import field
 
 import numpy as onp
 
 import jax
+from jax import vmap
 from jax import numpy as jnp
 from jax.random import split, PRNGKey
 
 from flax import struct
 from flax import linen as nn
+
+from tensorflow_probability.substrates import jax as tfp
+
+tfd = tfp.distributions
+tfb = tfp.bijectors
 
 
 @struct.dataclass
@@ -21,10 +28,11 @@ class TransformerConfig:
     dropout_rate: float = 0.1
     deterministic: bool = False
     d_model: int = 100
-    add_positional_encoding = False
+    add_positional_encoding: bool = False
     max_len: int = 3000  # positional encoding
     obs_emb_hidden_sizes: Sequence[int] = (200,)
     num_mixtures: int = 2
+    num_latents: int = 2
 
 
 class ObsEmbed(nn.Module):
@@ -187,6 +195,7 @@ class TransformerStack(nn.Module):
 
     @nn.compact
     def __call__(self, q):
+        assert len(q.shape) == 3
         cfg = self.config
         x = ObsEmbed(cfg)(q)
         enc_input = PositionalEncoder(cfg)(x) if cfg.add_positional_encoding else x
@@ -214,11 +223,43 @@ class TransformerStack(nn.Module):
         return seq_decoded
 
 
+class TransformerDiagGaussian(nn.Module):
+    config: TransformerConfig
+
+    @nn.compact
+    def __call__(self, q):
+        assert len(q.shape) == 3
+        cfg = self.config
+        x = ObsEmbed(cfg)(q)
+        enc_input = PositionalEncoder(cfg)(x) if cfg.add_positional_encoding else x
+
+        # for _ in range(cfg.num_enc_layers):
+        enc_input = nn.Sequential(
+            [EncoderLayer(cfg) for _ in range(cfg.num_enc_layers)]
+        )(enc_input)
+
+        start = self.param("start", nn.initializers.uniform(), (1, 1, cfg.d_model))
+        so_far_dec = start.repeat(q.shape[0], axis=0)
+
+        dec = so_far_dec
+        for _ in range(cfg.num_dec_layers):
+            dec = DecoderLayer(cfg)(dec, enc_input)
+
+        num_params = cfg.num_latents * 2  # covariances are the same dim as means
+        dist_params = nn.Sequential(
+            [nn.Dense(cfg.d_model * 2), nn.relu, nn.Dense(num_params)]
+        )(dec)
+        
+        assert dist_params.shape[1] == 1
+        return dist_params[:,0,:cfg.num_latents], dist_params[:,0,cfg.num_latents:]
+
+
 @struct.dataclass
 class GaussianMixturePosteriorConfig:
     num_latents: int = 2
     emb_size: int = 100
-    covariance_eps: float = 1e-6
+    covariance_eps: float = 1e-5
+    use_tril: bool = False
 
 
 class TransformerGaussianMixturePosterior(nn.Module):
@@ -236,11 +277,12 @@ class TransformerGaussianMixturePosterior(nn.Module):
             [nn.Dense(cfg.emb_size), nn.relu, nn.Dense(num_mixture_params)]
         )(seq_decoded)
 
-        mix_p = jax.nn.softmax(dist_params[:, :, 0])
+        # mix_p = jnp.exp(dist_params[:, :, 0])
+        mix_p = jax.nn.softmax(dist_params[:, :, 0], axis=-1)
         means = dist_params[:, :, 1 : 1 + num_means]
         covariance_terms = dist_params[:, :, -num_covariance_terms:]
         covariance_matrices = self.get_cov_matrices_from_vectors(
-            covariance_terms, num_means, cfg.covariance_eps
+            covariance_terms, num_means, cfg.covariance_eps, cfg.use_tril
         )
 
         return dict(
@@ -250,7 +292,7 @@ class TransformerGaussianMixturePosterior(nn.Module):
         )
 
     @staticmethod
-    def get_cov_matrices_from_vectors(covariance_terms, num_means, eps):
+    def get_cov_matrices_from_vectors(covariance_terms, num_means, eps, use_tril):
         x = covariance_terms
         output_shape = (*x.shape[:-1], num_means, num_means)
         x = jnp.concatenate([x, x[:, :, num_means:][:, :, ::-1]], axis=-1)
@@ -258,7 +300,11 @@ class TransformerGaussianMixturePosterior(nn.Module):
         x = jnp.triu(x)
 
         eps = jnp.eye(num_means)[None, None] * eps
-        cov_matrices = jnp.matmul(x, x.swapaxes(-2, -1)) + eps
+        cov_matrices = (
+            jnp.matmul(x, x.swapaxes(-2, -1)) + eps
+            if not use_tril
+            else x.swapaxes(-2, -1) + jnp.sqrt(eps)
+        )
         return cov_matrices
 
 
@@ -285,18 +331,69 @@ def gaussian_mixture_logpdf(latents, dist_params):
 
     return jax.nn.logsumexp(normals_log_prob + category_log_prob, axis=1)
 
-def select_mixture_sample(all_mixtures, index):
-    '''takes a single sample from a mixture density num_mixtures x num_variables and returns the value given by the :index:
-    mixture num_variables
-    '''
-    return all_mixtures[index,:]
 
-'''by vectorizing over the batch size, we can pick from each batch, a corresponding index.
+def gaussian_mixture_logpdf_no_dict(latents, mix_p, means, covs):
+    """
+    Parameters:
+    --------------
+    latents: jax.array with shape Batch x 1 x num_latents
+      the single dimension is needed so that the same sample gets broadcasted through all mixtures
+    mix_p: jax.array with shape Batch x num_mixtures encoding the probability of each mixture
+    means: jax.array with shape Batch x num_mixtures x num_means with the multivariate mean of each mixture
+    cov_matrices: jax.array with shape Batch x num_mixtures x num_means x num_means
+    """
+    assert len(latents.shape) == 3 and latents.shape[1] == 1
+    normals_log_prob = jax.scipy.stats.multivariate_normal.logpdf(latents, means, covs)
+    category_log_prob = jax.lax.log(mix_p)
+
+    return jax.nn.logsumexp(normals_log_prob + category_log_prob, axis=1)
+
+
+def sigmoid_trunc_gaussian_dist(means, covs, min: float, max: float):
+    """
+    returns a truncated normal by using a scaled sigmoid bijection.
+    applies the same bounds to all variables
+    """
+    norm = tfd.MultivariateNormalTriL(
+        loc=means,
+        scale_tril=covs,
+    )
+    trunc_norm = tfd.TransformedDistribution(
+        norm,
+        tfb.Chain(
+            [
+                tfb.Shift(shift=min),
+                tfb.Scale(scale=max - min),
+                tfb.Sigmoid(),
+                tfb.Scale(scale=1.0),  # added to make the truncation smoother
+            ]
+        ),
+    )
+    return trunc_norm
+
+
+def sigmoid_trunc_gaussian_mixture_logpdf(latents, mix_p, means, covs, min, max):
+    trunc_norm = sigmoid_trunc_gaussian_dist(means, covs, min, max)
+    trunc_norm_log_prob = trunc_norm.log_prob(latents)
+    category_log_prob = jax.lax.log(mix_p)
+
+    return jax.nn.logsumexp(trunc_norm_log_prob + category_log_prob, axis=1)
+
+
+def select_mixture_sample(all_mixtures, index):
+    """takes a single sample from a mixture density num_mixtures x num_variables and returns the value given by the :index:
+    mixture num_variables
+    """
+    return all_mixtures[index, :]
+
+
+"""by vectorizing over the batch size, we can pick from each batch, a corresponding index.
 essentially a fast version of:
 
     onp.concatenate([batched_all_mixtures[i,idx] for i,idx in enumerate(batched_index)])
-'''
-v_select_mixture_sample = jax.vmap(select_mixture_sample, in_axes=(0, 0))
+"""
+v_select_mixture_sample = vmap(select_mixture_sample, in_axes=(0, 0))
+
 
 def gaussian_mixture_sample(key, dist_params):
     mix_p, means, covs = (
@@ -307,8 +404,30 @@ def gaussian_mixture_sample(key, dist_params):
     key, subkey = split(key)
     n_sample = jax.random.multivariate_normal(key, means, covs)
     cat_sample = jax.random.categorical(subkey, jax.lax.log(mix_p), axis=-1)
-    
+
     chosen_sample = v_select_mixture_sample(n_sample, cat_sample)
+    return chosen_sample
+
+
+@partial(vmap, in_axes=(0, 0, 0, 0, None, None))
+def v_sigmoid_trunc_gaussian_mixture_sample(key, mix_p, means, covs, min, max):
+    key, subkey = split(key)
+    trunc_norm = sigmoid_trunc_gaussian_dist(means, covs, min, max)
+    n_sample = trunc_norm.sample(seed=key)
+    cat_sample = jax.random.categorical(subkey, jax.lax.log(mix_p), axis=-1)
+
+    chosen_sample = n_sample[cat_sample]
+    return chosen_sample
+
+
+@vmap
+def v_gaussian_mixture_sample(key, mix_p, means, covs):
+    key, subkey = split(key)
+    n_sample = jax.random.multivariate_normal(key, means, covs)
+    cat_sample = jax.random.categorical(subkey, jax.lax.log(mix_p), axis=-1)
+    # print(n_sample.shape, cat_sample.shape)
+    # chosen_sample = v_select_mixture_sample(n_sample, cat_sample)
+    chosen_sample = n_sample[cat_sample]
     return chosen_sample
 
 
@@ -347,7 +466,7 @@ class IndependentGaussianMixtures(nn.Module):
 
         v = onp.cumsum(onp.array((0, *cfg.num_mixtures_per_group)))
         seq_dec_list = [seq_decoded[:, v[i] : v[i + 1]] for i in range(len(v) - 1)]
-        
+
         dist_params_list = []
         for seq_dec, n_vars in zip(seq_dec_list, cfg.group_variables):
             d_pars = TransformerGaussianMixturePosterior(

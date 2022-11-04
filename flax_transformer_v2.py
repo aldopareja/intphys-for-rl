@@ -244,14 +244,14 @@ class TransformerDiagGaussian(nn.Module):
         dec = so_far_dec
         for _ in range(cfg.num_dec_layers):
             dec = DecoderLayer(cfg)(dec, enc_input)
-
+        
         num_params = cfg.num_latents * 2  # covariances are the same dim as means
         dist_params = nn.Sequential(
             [nn.Dense(cfg.d_model * 2), nn.relu, nn.Dense(num_params)]
         )(dec)
         
         assert dist_params.shape[1] == 1
-        return dist_params[:,0,:cfg.num_latents], dist_params[:,0,cfg.num_latents:]
+        return dist_params[:,0,:cfg.num_latents], jnp.exp(dist_params[:,0,cfg.num_latents:])
 
 
 @struct.dataclass

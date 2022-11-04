@@ -103,8 +103,8 @@ def initialize_model_and_state(
     key, *sks = split(key, 10)
 
     cfg = RealNVPConfig(
-        f_mlp_hidden_size=20,
-        f_mlp_num_layers=3,
+        f_hidden_size=20,
+        f_num_layers=3,
         num_latent_vars=2,
         num_flow_layers=5,
         q_mlp_hidden_size=200,

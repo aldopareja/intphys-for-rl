@@ -226,7 +226,8 @@ def coord_to_array_idx(x):
     return jnp.int32(((x/MAX_DRAW_SIDE + 1.0) / 2 * RESOLUTION).round())
 
 def simulate(key, latents, obs_noise_std: float, num_points: int):
-    hx, hy, hz = latents[:3]
+    assert len(latents.shape) == 1 and latents.shape[0] == 10
+    hx, hy, hz = jnp.abs(latents[:3])
     t = latents[3:6]
     q = latents[6:]
     ks = split(key)
@@ -285,7 +286,7 @@ def draw_box(box):
     depth_map = render_box(xs, ys, box, False)
     fig1, ax2 = plt.subplots(constrained_layout=True)
 
-    cs = ax2.contourf(xs, ys, depth_map, 1000, cmap="hot")
+    cs = ax2.contourf(xs, ys, depth_map, 1000,)
     cbar = fig1.colorbar(cs)
     return ax2, fig1
 

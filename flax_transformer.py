@@ -258,7 +258,7 @@ class TransformerStack(nn.Module):
   def __call__(self, q):
     cfg = self.config
     x = ObsEmbed(cfg)(q)
-    enc_input = PositionalEncoder(cfg)(x)
+    enc_input = PositionalEncoder(cfg)(x) if cfg.add_postitional_encoding else x
 
     # for _ in range(cfg.num_enc_layers):
     enc_input = nn.Sequential([EncoderLayer(cfg) for _ in range(cfg.num_enc_layers)])(enc_input)

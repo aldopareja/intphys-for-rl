@@ -15,7 +15,11 @@ import optax
 from RealNVP_flow import RealNVP_trunc, RealNVPConfig
 from flax_transformer_v2 import TransformerConfig, TransformerDiagGaussian
 
-from box_model import MAX_LATENT, generative_model, simulate
+from box_model import (
+    MAX_LATENT,
+    generative_model,
+    score_many_point_clouds_from_many_latents,
+)
 
 
 class AttrDict(dict):
@@ -151,10 +155,10 @@ def update_step(
     key,
 ):
     assert beta >= 0 and beta <= 1
+    flow_key, dropout_key, sim_k = split(key, 3)
 
     def loss(params, point_cloud_, latents_):
         batch_size = point_cloud_.shape[0]
-        flow_key, dropout_key, sim_k = split(key, 3)
         latent_log_prob, z_sample = apply_func(
             {"params": params, **state},
             point_cloud_,
@@ -162,32 +166,15 @@ def update_step(
             rngs={"rsample_key": flow_key, "dropout": dropout_key},
         )
 
-        # pc_hat, _ = vmap(simulate, in_axes=(0, 0, None, None))(
-        #     split(sim_k, batch_size),
-        #     z_sample,
-        #     0.01,#OBSERVATION_NOISE, for the resimulation better to add very little noise, it's enough on the observation
-        #     NUM_POINTS,
-        # )
+        reconstruction_loss = score_many_point_clouds_from_many_latents(
+            point_cloud_, z_sample
+        )
 
-        # try to stablize training
-        # latent_log_prob = jnp.where(latent_log_prob>-1e2, latent_log_prob, 0.0)
-        # reconstruction_loss = -vmap(sum_gaussian_logpdf)(q, x_hat, jnp.abs(x_hat) * proportional_noise).mean()
-        # reconstruction_loss = ((point_cloud - pc_hat) ** 2).mean(axis=(1,2))
-
-        l = -latent_log_prob.mean() * (
-            1 - beta
-        )  # - beta * (latent_log_prob/jax.lax.stop_gradient(reconstruction_loss)).mean()
-        return l, jnp.array(0.0)  # jax.lax.stop_gradient(reconstruction_loss.mean())
-
-    # l_grad = jax.jit(jax.value_and_grad(loss,argnums=(0,)))
-    # gs = []
-    # ls = []
-    # for i in range(point_cloud.shape[0]):
-    #     l, g_i = l_grad(params,i,point_cloud[i:i+1],latents[i:i+1])
-    #     gs.append(g_i)
-    #     ls.append(l)
-    #     if check_for_nans(g_i):
-    #         loss(params,i, point_cloud[i:i+1],latents[i:i+1])
+        l = -latent_log_prob.mean() * (1 - beta) - beta * reconstruction_loss.mean()
+        return l, (
+            jax.lax.stop_gradient(reconstruction_loss.mean()),
+            jax.lax.stop_gradient(latent_log_prob.mean()),
+        )
 
     (l, rc), grads = jax.value_and_grad(loss, has_aux=True)(
         params, point_cloud, latents
@@ -233,26 +220,26 @@ if __name__ == "__main__":
     )
 
     ## reconstruction params
-    beta = 0.0
+    beta = 0.5
 
     ## checkpoint params
     cfg.save_params = 2
     cfg.print_every = 1
-    cfg.chkpt_folder = "box_chkpts_high_cap_3/"
+    cfg.chkpt_folder = "box_chkpts_diff_lk/"
     cfg.load_idx = 0
     wandb.config.update(cfg)
 
     ## optim config
     cfg.optim_cfg = OptimCfg(
-        max_lr=5e-5,
+        max_lr=2e-4,
         num_steps=int(10000),
-        pct_start=0.01,
+        pct_start=0.05,
         div_factor=1e1,
-        final_div_factor=1e0,
+        final_div_factor=1e1,
         weight_decay=0.0005,
         gradient_clipping=5.0,
     )
-    wandb.config.update({'optim_cfg':cfg.optim_cfg.__dict__})
+    wandb.config.update({"optim_cfg": cfg.optim_cfg.__dict__})
 
     m, tx, opt_state, params, state = initialize_model_and_state(
         key=PRNGKey(1574),
@@ -321,8 +308,18 @@ if __name__ == "__main__":
                 losses.append(jax.lax.stop_gradient(l))
                 rcs.append(rc)
                 if i % cfg.print_every == 0:
-                    print(e, i, l)
-                    wandb.log({"epoch": e, "i": i, "l": l, "norm": norm, "gn": gn})
+                    print(e, i, l, rc)
+                    wandb.log(
+                        {
+                            "epoch": e,
+                            "i": i,
+                            "l": l,
+                            "norm": norm,
+                            "gn": gn,
+                            "log_prob": rc[0],
+                            "rc": rc[1],
+                        }
+                    )
                 if jnp.isnan(l) or l == 0 or jnp.isinf(l):
                     print("failed", e, i, l, rc)
                     finished = True

@@ -1,4 +1,7 @@
+from json import load
+import pickle
 from copy import deepcopy
+from stringprep import in_table_a1
 from typing import Dict
 
 import numpy as onp
@@ -6,6 +9,7 @@ import numpy as onp
 import jax
 from jax.random import split, PRNGKey, uniform
 from jax import numpy as jnp
+from jax.config import config
 
 import optax
 
@@ -25,6 +29,7 @@ from flax_transformer_v2 import (
     GaussianMixturePosteriorConfig,
     TransformerConfig,
     gaussian_mixture_logpdf,
+    gaussian_mixture_sample
 )
 
 _DEFAULT_CAMERA = {
@@ -81,7 +86,7 @@ def get_default_light():
     return Light(**_DEFAULT_LIGHT)
 
 
-def render_depth_array(env_cfg, qp_dict, height=320, width=320):
+def render_depth_array(env_cfg, qp_dict, height=320, width=320, *_):
     sys = brax.System(env_cfg)
     my_qp = brax.QP(**qp_dict)
     scene, instances = _scene(sys, my_qp)
@@ -175,6 +180,13 @@ def compute_diffs(batch_qp):
     )
     return dict(pos_diff=pos_diff[:,None], rot_diff=rot_diff[:,None])
 
+def build_render_args(batch_qp, height, width, num_points):
+    args = [
+        (default_env, jax.tree_map(lambda x: x[i], batch_qp), height, width, num_points)
+        for i in range(batch_qp['pos'].shape[0])
+    ]
+    return args
+
 
 def generate_data_batch(
     key: PRNGKey, batch_size, height=320, width=320, num_points=999
@@ -182,11 +194,8 @@ def generate_data_batch(
     batch_qp = vj_sample_qp(split(key, batch_size * 2))
     diffs = compute_diffs(batch_qp)
     batch_qp, diffs = jax.tree_map(lambda x: onp.array(x), [batch_qp, diffs])
-    # diffs = jax.tree_map(lambda x: onp.array(x), diffs)
-    args = [
-        (default_env, jax.tree_map(lambda x: x[i], batch_qp), height, width, num_points)
-        for i in range(batch_size * 2)
-    ]
+
+    args = build_render_args(batch_qp, height, width, num_points)
     point_clouds = array_apply(render_point_cloud, args, True, chunksize=1000)
     point_clouds = onp.stack(point_clouds)
 
@@ -198,7 +207,36 @@ def generate_data_batch(
     return diffs, point_clouds
 
 
-def update_step(apply_fn, p_clouds, latents_list, opt_state, params, state, dropout_key, tx):
+def generate_single_example(key, height=320, width=320, num_points=999):
+    batch_qp = vj_sample_qp(split(key))
+    diffs = compute_diffs(batch_qp)
+    batch_qp, diffs = jax.tree_map(lambda x: onp.array(x), [batch_qp, diffs])
+    args = build_render_args(batch_qp, height, width, num_points)
+    depths = array_apply(render_depth_array, args, False)
+    point_clouds = array_apply(render_point_cloud, args, False)
+    point_clouds = onp.stack(point_clouds)
+
+    # concatenate in pairs since we want to predict differences
+    point_clouds = onp.concatenate(
+        [point_clouds[0 : 2 : 2], point_clouds[1 : 2 : 2]],
+        axis=-1,
+    )
+    return batch_qp, diffs, depths, point_clouds
+
+def sample_diffs_from_posterior(key, dist_params_list, num_samples):
+    ks = split(key, num_samples*2)
+    pos_dif = jax.vmap(gaussian_mixture_sample, in_axes=(0,None))(ks[:num_samples], dist_params_list[0])
+    rot_dif = jax.vmap(gaussian_mixture_sample, in_axes=(0,None))(ks[num_samples:], dist_params_list[1])
+    return dict(pos_diff=pos_dif, rot_diff=rot_dif)
+
+def add_diffs_to_qp(qp, diffs):
+    pos = qp['pos'] + diffs['pos_diff']
+    rot = jax.vmap(jax.vmap(brax.math.quat_mul),in_axes=(0,None))(diffs['rot_diff'], qp['rot'])
+    return dict(pos=pos, rot=rot, vel=jnp.zeros(pos.shape), ang=jnp.zeros(pos.shape))
+    
+
+
+def update_step(apply_fn, p_clouds, latents_list, opt_state, params, state, dropout_key, tx:optax.GradientTransformation):
     def loss(params):
         d_params_list = apply_fn(
             {"params": params, **state}, p_clouds, rngs={"dropout": dropout_key}
@@ -214,13 +252,14 @@ def update_step(apply_fn, p_clouds, latents_list, opt_state, params, state, drop
     params = optax.apply_updates(params, updates)
     return opt_state, params, l
 
-
-if __name__ == "__main__":
+def procedure(load_save):
     key, *sks = split(PRNGKey(12345), 10)
-    generation_size = 10000
-    batch_size = 100
+    generation_size = 200000
+    batch_size = 300
     obs_length = 999
     num_epochs = 999999
+    load_idx = load_save
+    save_idx = load_save+1
 
     m = IndependentGaussianMixtures(
         IndependentGaussianMixtureConfig(
@@ -235,17 +274,36 @@ if __name__ == "__main__":
     )
     state, params = variables.pop('params')
     del variables
+    
+    # params_checkpoints = {}
+    save_params = 10
 
-    tx = optax.adam(learning_rate=0.001)
+    tx = optax.adam(learning_rate=0.0001)
     opt_state = tx.init(params)
 
-    for e in range(num_epochs):
+    with open(f'params_{load_idx}', 'rb') as f:
+        params = pickle.load(f)
+    with open(f'opt_state_{load_idx}', 'rb') as f:
+        opt_state = pickle.load(f)    
+    with open(f'key_{load_idx}', 'rb') as f:
+        loaded_key = pickle.load(f)    
+    
 
+    finished = False
+    print_every = 20
+    for e in range(num_epochs):
+        old_key = key
+        key = loaded_key if e == 0 else key
         key, subkey = split(key)
         diffs, p_clouds = generate_data_batch(subkey, generation_size, num_points=obs_length)
         for i in range(generation_size//batch_size - 1):
+            # if (i+1) % save_params == 0:
+            #     params_checkpoints[f'opt_state_{e}_{i}'] = jax.tree_map(onp.array,opt_state)
+            #     params_checkpoints[f'params_{e}_{i}'] = jax.tree_map(onp.array,params)
+            #     params_checkpoints[f'key_{e}_{i}'] = jax.tree_map(onp.array,key)
             key, subkey = split(key)
-            opt_state, params, l = update_step(
+            # opt_state, params, l = update_step(
+            opt_state, params, l = jax.jit(update_step, static_argnums=(0,7))(
                 m.apply,
                 p_clouds = jnp.array(p_clouds[i*batch_size: (i+1)*batch_size]),
                 latents_list = [jnp.array(diffs['pos_diff'][i*batch_size: (i+1)*batch_size]), 
@@ -256,7 +314,107 @@ if __name__ == "__main__":
                 dropout_key=subkey,
                 tx=tx,
             )
+            if i%print_every == 0:
+                print(e,i,l)
+                # print(e,i,0)
             if jnp.isnan(l) or l == 0:
+            # if  (e==89 and i == 499):
                 print('failed',e,i,l)
-                finish = True
+                finished = True
                 break
+            if (i+1) % save_params == 0:
+                with open(f'params_{save_idx}','wb') as f:
+                        pickle.dump(params, f)
+                with open(f'opt_state_{save_idx}','wb') as f:
+                        pickle.dump(opt_state, f)
+                with open(f'key_{save_idx}','wb') as f:
+                        pickle.dump(old_key, f)
+
+        if finished:
+            break
+
+
+
+if __name__ == "__main__":
+    load_save = 17
+    while True:
+        procedure(load_save)
+        load_save += 1
+    # key, *sks = split(PRNGKey(12345), 10)
+    # generation_size = 20000
+    # batch_size = 150
+    # obs_length = 999
+    # num_epochs = 999999
+    # load_idx = 4
+    # save_idx = 5
+
+    # m = IndependentGaussianMixtures(
+    #     IndependentGaussianMixtureConfig(
+    #         group_variables=(3, 4), num_mixtures_per_group=(2, 8)
+    #     ),
+    #     GaussianMixturePosteriorConfig(),
+    #     TransformerConfig(),
+    # )
+
+    # variables = m.init(
+    #     {"params": sks[0], "dropout": sks[1]}, jnp.ones((batch_size, obs_length, 6))
+    # )
+    # state, params = variables.pop('params')
+    # del variables
+    
+    # params_checkpoints = {}
+    # save_params = 10
+
+    # tx = optax.adam(learning_rate=0.0005)
+    # opt_state = tx.init(params)
+
+    # with open(f'params_{load_idx}', 'rb') as f:
+    #     params = pickle.load(f)
+    # with open(f'opt_state_{load_idx}', 'rb') as f:
+    #     opt_state = pickle.load(f)    
+    # with open(f'key_{load_idx}', 'rb') as f:
+    #     loaded_key = pickle.load(f)    
+    
+
+    # finished = False
+    # print_every = 10
+    # for e in range(num_epochs):
+    #     old_key = key
+    #     key = loaded_key if e == 0 else key
+    #     key, subkey = split(key)
+    #     diffs, p_clouds = generate_data_batch(subkey, generation_size, num_points=obs_length)
+    #     for i in range(generation_size//batch_size - 1):
+    #         if (i+1) % save_params == 0:
+    #             params_checkpoints[f'opt_state_{e}_{i}'] = jax.tree_map(onp.array,opt_state)
+    #             params_checkpoints[f'params_{e}_{i}'] = jax.tree_map(onp.array,params)
+    #             params_checkpoints[f'key_{e}_{i}'] = jax.tree_map(onp.array,key)
+    #         key, subkey = split(key)
+    #         # opt_state, params, l = update_step(
+    #         opt_state, params, l = jax.jit(update_step, static_argnums=(0,7))(
+    #             m.apply,
+    #             p_clouds = jnp.array(p_clouds[i*batch_size: (i+1)*batch_size]),
+    #             latents_list = [jnp.array(diffs['pos_diff'][i*batch_size: (i+1)*batch_size]), 
+    #                             jnp.array(diffs['rot_diff'][i*batch_size: (i+1)*batch_size])],
+    #             opt_state=opt_state,
+    #             params = params,
+    #             state = state,
+    #             dropout_key=subkey,
+    #             tx=tx,
+    #         )
+    #         if i%print_every == 0:
+    #             print(e,i,l)
+    #             # print(e,i,0)
+    #         if jnp.isnan(l) or l == 0:
+    #         # if  (e==89 and i == 499):
+    #             print('failed',e,i,l)
+    #             finished = True
+    #             break
+    #         with open(f'params_{save_idx}','wb') as f:
+    #                 pickle.dump(params, f)
+    #         with open(f'opt_state_{save_idx}','wb') as f:
+    #                 pickle.dump(opt_state, f)
+    #         with open(f'key_{save_idx}','wb') as f:
+    #                 pickle.dump(old_key, f)
+
+    #     if finished:
+    #         break

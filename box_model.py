@@ -110,6 +110,7 @@ def make_box(half_size_x, half_size_y, half_size_z, translation, rot_quaternion)
     v_rotate = vmap(rotate, in_axes=(0, None))
 
     planes_normals = v_rotate(planes_normals, q)
+    planes_normals += jnp.where(jnp.isclose(planes_normals,0),1e-7,0.0)
 
     corners = []
     for i in range(3):
@@ -128,6 +129,7 @@ def make_box(half_size_x, half_size_y, half_size_z, translation, rot_quaternion)
 
     normals = jnp.concatenate([jnp.eye(3), -jnp.eye(3)], axis=0)
     normals = v_rotate(normals, q)
+    normals += jnp.where(jnp.isclose(normals,0),1e-7,0.0)
 
     box_planes = jnp.concatenate([normals, planes_d], axis=1)
     box_planes = vmap(translate_plane, in_axes=(0, None))(box_planes, t)
@@ -200,16 +202,7 @@ render_box = vmap(
 )
 
 
-# @partial(vmap, in_axes=(0, 0, None))
-# @partial(vmap, in_axes=(0, 0, None))
-# def sample_noise(key, mask_bit, noise_std):
-#     return jax.lax.cond(
-#         mask_bit, lambda: normal(key) * noise_std, lambda: jnp.array(0.0)
-#     )
 
-
-# @partial(vmap, in_axes=(0, 0, None))
-# @partial(vmap, in_axes=(0, None))
 @vmap
 def make_p_mask(depth):
     assert len(depth.shape) == 0
@@ -225,14 +218,19 @@ def coord_to_array_idx(x):
     assert len(x.shape) == 1 and x.dtype == jnp.float32
     return jnp.int32(((x/MAX_DRAW_SIDE + 1.0) / 2 * RESOLUTION).round())
 
-def simulate(key, latents, obs_noise_std: float, num_points: int):
+def make_box_from_latents(latents):
     assert len(latents.shape) == 1 and latents.shape[0] == 10
     hx, hy, hz = jnp.abs(latents[:3])
     t = latents[3:6]
     q = latents[6:]
-    ks = split(key)
     
     box = make_box(hx, hy, hz, t, q/jnp.linalg.norm(q))
+    return box
+
+def simulate(key, latents, obs_noise_std: float, num_points: int):
+    box = make_box_from_latents(latents)
+    
+    ks = split(key)
 
     xs, ys = [array_idx_to_coord(jnp.arange(RESOLUTION)) for _ in range(2)]
     depth, xs, ys = render_box(xs, ys, box, True)
@@ -251,7 +249,6 @@ def simulate(key, latents, obs_noise_std: float, num_points: int):
 
     point_cloud = jnp.stack([xs,ys,depth], axis=1) 
     return point_cloud, box
-    
 
 def generative_model(
     key: PRNGKey, obs_noise_std: float, num_points: int
@@ -301,6 +298,26 @@ def overimpose_point_cloud(fig, ax, pc):
     ys = (pc[:,0])
     cs = ax.scatter(xs, ys, c=pc[:, 2], s=2, cmap="hot")
     # fig.colorbar(cs)
+    
+    
+#### scoring point clouds
+    
+def score_point_from_box(point, box):
+    x,y,z = point
+    z_box = get_depth_pixel_from_box(x,y,box)
+    return jax.scipy.stats.norm.logpdf(z,loc=z_box)
+
+def score_point_cloud_from_box(pc, box):
+    all_scores = vmap(score_point_from_box, in_axes=(0,None))(pc, box)
+    return all_scores.mean()
+
+score_point_cloud_from_many_boxes = jax.jit(vmap(score_point_cloud_from_box, in_axes=(None, 0)))
+
+def score_point_cloud_from_latents(pc,latents):
+    box = make_box_from_latents(latents)
+    return score_point_cloud_from_box(pc,box)
+
+score_many_point_clouds_from_many_latents = vmap(score_point_cloud_from_latents,in_axes=(0,0))
 
 if __name__ == "__main__":
     pc, latents, box = generative_model(
